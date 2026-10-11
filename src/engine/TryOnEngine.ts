@@ -341,7 +341,9 @@ export class TryOnEngine {
       this.emit();
       try {
         this.hairBuf ??= (await download(modelSources(HAIR_FILE), track(HAIR_FILE))).data;
-        this.segmenter = await create((fs, d) => ImageSegmenter.createFromOptions(fs, hairOpts(this.hairBuf!, d)));
+        // hair always on CPU: on several phone GPUs MediaPipe's confidence masks read back as noise
+        // (blue speckles over the whole frame); the 256×256 model is light enough for the CPU
+        this.segmenter = await create((fs) => ImageSegmenter.createFromOptions(fs, hairOpts(this.hairBuf!, "CPU")));
         this.hairModel = "ready";
       } catch (e) {
         console.error("[try-on] hair model failed", e);
