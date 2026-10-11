@@ -7,7 +7,7 @@
 
 A Persian (RTL) cosmetics store where shoppers try lipstick and hair colour on their own face before buying. They can use the live camera or a photo. Every frame is processed in the browser, on the shopper's device, and no image is ever uploaded.
 
-**Live demo:** <https://lumiere.onrender.com>. Open it on a phone or laptop and allow the camera, or pick a photo.
+**Live demo:** <https://lumiere-edn8.onrender.com>. Open it on a phone or laptop and allow the camera, or pick a photo.
 
 [نسخه‌ی فارسی](README.fa.md)
 
