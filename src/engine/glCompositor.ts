@@ -86,9 +86,14 @@ void main() {
       m = acc / ws;
     }
     m = smoothstep(0.28, 0.72, m);
+    float t = l / uHairMean;
+    // a pixel far brighter than the person's hair is wall/sky/skin at the mask edge, not hair
+    m *= 1.0 - smoothstep(2.2, 3.4, t);
     if (m > 0.001) {
-      float t = l / uHairMean;
-      float x = roll(uHairL * pow(t, 0.85));
+      // big brightness jumps (dark hair → light shade) flatten texture contrast so noise isn't amplified
+      float gain = uHairL / uHairMean;
+      float e = mix(0.85, 0.5, smoothstep(1.5, 5.0, gain));
+      float x = roll(uHairL * pow(min(t, 2.2), e));
       vec3 rc = tint(uHairRGB, uHairL, x);
       col = mix(col, rc, m * uHairAmt);
     }

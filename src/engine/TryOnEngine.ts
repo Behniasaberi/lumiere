@@ -115,6 +115,8 @@ export class TryOnEngine {
   hint: Hint = "";
   /** Download progress 0..1: `face` covers the engine + face model (lipstick), `hair` the hair model. */
   loadProgress = { face: 0, hair: 0 };
+  /** False when the browser has WebGL switched off — the AI models cannot run without it. */
+  webgl = true;
   sourceKind: "none" | "camera" | "photo" = "none";
 
   private listeners = new Set<() => void>();
@@ -211,6 +213,19 @@ export class TryOnEngine {
   }
 
   private async loadModels() {
+    // MediaPipe needs WebGL even in CPU mode; without it nothing can run, so say so up front
+    try {
+      const gl = document.createElement("canvas").getContext("webgl2") ?? document.createElement("canvas").getContext("webgl");
+      this.webgl = !!gl;
+      gl?.getExtension("WEBGL_lose_context")?.loseContext(); // free the test context right away
+    } catch {
+      this.webgl = false;
+    }
+    if (!this.webgl) {
+      this.face = this.hairModel = "failed";
+      this.emit();
+      return;
+    }
     this.face = this.hairModel = "loading";
     this.emit();
 
@@ -321,16 +336,26 @@ export class TryOnEngine {
     this.dirty = true;
     this.emit();
 
-    try {
-      this.hairBuf = (await download(modelSources(HAIR_FILE), track(HAIR_FILE))).data;
-      this.segmenter = await create((fs, d) => ImageSegmenter.createFromOptions(fs, hairOpts(this.hairBuf!, d)));
-      this.hairModel = "ready";
-    } catch (e) {
-      console.error(e);
-      this.hairModel = "failed";
-    }
-    this.dirty = true;
-    this.emit();
+    this.loadHair = async () => {
+      this.hairModel = "loading";
+      this.emit();
+      try {
+        this.hairBuf ??= (await download(modelSources(HAIR_FILE), track(HAIR_FILE))).data;
+        this.segmenter = await create((fs, d) => ImageSegmenter.createFromOptions(fs, hairOpts(this.hairBuf!, d)));
+        this.hairModel = "ready";
+      } catch (e) {
+        console.error("[try-on] hair model failed", e);
+        this.hairModel = "failed";
+      }
+      this.dirty = true;
+      this.emit();
+    };
+    await this.loadHair();
+  }
+  private loadHair: () => Promise<void> = async () => {};
+  /** Try the hair model again after a failure (shown as a button in the mirror). */
+  retryHair() {
+    if (this.hairModel === "failed" && this.webgl) this.loadHair();
   }
   private rebuildOnCpu: () => Promise<void> = async () => {};
 

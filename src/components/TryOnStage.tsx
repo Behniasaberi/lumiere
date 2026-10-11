@@ -135,9 +135,17 @@ export function TryOnStage({ shape = "frame", split = null, onSplit, compact }: 
         </div>
       )}
 
+      {!modelsFailed && e.face === "ready" && e.hairModel === "failed" && (
+        <p className="stage__error stage__error--block" role="alert">
+          رژ لب آماده است ولی مدل رنگ مو روی این دستگاه بالا نیامد.{" "}
+          <button className="link" onClick={() => engine.retryHair()}>دوباره امتحان کنید</button>
+        </p>
+      )}
       {modelsFailed && (
         <p className="stage__error stage__error--block" role="alert">
-          فایل‌های هوش مصنوعی بارگذاری نشدند. پوشه‌ی public/models را بررسی کنید (راهنما در README).
+          {e.webgl
+            ? "فایل‌های آینه بارگذاری نشدند. اتصال اینترنت را بررسی کنید و صفحه را دوباره باز کنید."
+            : "شتاب‌دهنده‌ی گرافیکی (WebGL) در این مرورگر خاموش است و آینه بدون آن کار نمی‌کند. در تنظیمات مرورگر گزینه‌ی «Use graphics acceleration when available» را روشن کنید و مرورگر را دوباره باز کنید."}
         </p>
       )}
 
