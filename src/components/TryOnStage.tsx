@@ -23,6 +23,14 @@ interface Props {
 
 export function TryOnStage({ shape = "frame", split = null, onSplit, compact }: Props) {
   const e = useEngine();
+  const debug = typeof location !== "undefined" && location.search.includes("debug");
+  // in debug mode refresh the numbers twice a second
+  const [, tick] = useState(0);
+  useEffect(() => {
+    if (!debug) return;
+    const id = setInterval(() => tick((n) => n + 1), 500);
+    return () => clearInterval(id);
+  }, [debug]);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const [error, setError] = useState("");
@@ -140,6 +148,11 @@ export function TryOnStage({ shape = "frame", split = null, onSplit, compact }: 
           رژ لب آماده است ولی مدل رنگ مو روی این دستگاه بالا نیامد.{" "}
           <button className="link" onClick={() => engine.retryHair()}>دوباره امتحان کنید</button>
         </p>
+      )}
+      {debug && (
+        <pre className="stage__debug" dir="ltr">
+          {`fps ${e.stats.fps.toFixed(1)} · face ${e.stats.faceMs.toFixed(0)}ms · hair ${e.stats.hairMs.toFixed(0)}ms\n${e.delegate} · ${e.stats.renderer.slice(0, 60)}`}
+        </pre>
       )}
       {modelsFailed && (
         <p className="stage__error stage__error--block" role="alert">

@@ -848,3 +848,62 @@ body::before {
 .sect--tint + .sect--tint, .band + .sect--tint { margin-top: 0; }
 .sect--tint .card__wish, .sect--tint .card__try { box-shadow: 0 6px 18px -10px rgba(120, 40, 60, 0.35); }
 @media (max-width: 760px) { .sect--tint { margin-top: 64px; padding-block: 48px; } }
+
+/* ---------- Motion: endless shade ribbon + living product cards ---------- */
+/* RTL: the track hangs from the right edge, so it travels right by one row (of three) and loops seamlessly */
+@keyframes marquee { from { transform: translateX(0); } to { transform: translateX(33.3333%); } }
+
+/* idle life: lipsticks float, hair swatches sway from the cap */
+@keyframes lip-float { 0%, 100% { transform: scale(1.07) translateY(0) rotate(0deg); } 50% { transform: scale(1.07) translateY(-7px) rotate(-1.2deg); } }
+@keyframes hair-sway { 0%, 100% { transform: scale(1.07) skewX(0deg); } 30% { transform: scale(1.07) skewX(1.6deg); } 70% { transform: scale(1.07) skewX(-1.6deg); } }
+@keyframes card-in { from { opacity: 0; transform: translateY(26px) scale(0.98); } to { opacity: 1; transform: none; } }
+@keyframes shine { from { transform: translateX(-130%) skewX(-18deg); } to { transform: translateX(230%) skewX(-18deg); } }
+
+.card--lip .card__media img, .coll--lip .coll__media img, .lookcard__media span:last-child img {
+  transform-origin: 50% 60%; animation: fade 0.35s var(--ease), lip-float 5.5s ease-in-out 0.35s infinite;
+}
+.card--hair .card__media img, .coll--hair .coll__media img, .lookcard__media span:first-child img {
+  transform-origin: 50% 14%; animation: fade 0.35s var(--ease), hair-sway 6.5s ease-in-out 0.35s infinite;
+}
+/* de-sync neighbours so the grid breathes instead of marching */
+.grid4 > :nth-child(4n + 2) img, .collections > :nth-child(2) img, .looks-row > :nth-child(2) img { animation-delay: 0s, -1.4s; }
+.grid4 > :nth-child(4n + 3) img, .collections > :nth-child(3) img, .looks-row > :nth-child(3) img { animation-delay: 0s, -2.8s; }
+.grid4 > :nth-child(4n + 4) img, .collections > :nth-child(4) img, .looks-row > :nth-child(4) img { animation-delay: 0s, -4.1s; }
+.lookcard__media span:first-child img { animation-duration: 0.35s, 7.2s; }
+.coll--hair .coll__media img { object-position: 50% 0%; transform-origin: 50% 6%; }
+
+/* hover: the stage lifts, a light sweep passes, the product speeds up */
+.card__media > a { display: block; height: 100%; transition: transform 0.7s var(--ease); }
+.card:hover .card__media > a { transform: scale(1.045); }
+.card:hover .card__media img, .coll:hover .coll__media img, .lookcard:hover img { animation-duration: 0.35s, 2.6s; }
+.card__badge, .card__wish, .card__try { z-index: 3; }
+.card__media::after, .coll__media::after, .lookcard__media::after {
+  content: ""; position: absolute; inset: 0 auto 0 0; width: 45%; z-index: 2; pointer-events: none;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.55), transparent);
+  transform: translateX(-130%) skewX(-18deg);
+}
+.card:hover .card__media::after, .coll:hover .coll__media::after, .lookcard:hover .lookcard__media::after { animation: shine 0.9s var(--ease); }
+.coll__media, .lookcard__media { position: relative; transition: transform 0.45s var(--ease), box-shadow 0.45s var(--ease); }
+.coll:hover .coll__media, .lookcard:hover .lookcard__media { transform: translateY(-4px); box-shadow: 0 26px 50px -30px rgba(60, 20, 30, 0.45); }
+.lookcard:hover .lookcard__media { grid-template-columns: 1.12fr 0.88fr; }
+.lookcard__media { transition: grid-template-columns 0.5s var(--ease), transform 0.45s var(--ease), box-shadow 0.45s var(--ease); }
+.lookcard:hover .lookcard__media:has(span:last-child:hover) { grid-template-columns: 0.88fr 1.12fr; }
+
+/* staggered entrance when a section scrolls into view */
+.reveal :is(.grid4, .collections, .looks-row) > * { opacity: 0; }
+.reveal.is-in :is(.grid4, .collections, .looks-row) > * { animation: card-in 0.8s var(--ease) both; }
+.reveal.is-in :is(.grid4, .collections, .looks-row) > :nth-child(2) { animation-delay: 0.08s; }
+.reveal.is-in :is(.grid4, .collections, .looks-row) > :nth-child(3) { animation-delay: 0.16s; }
+.reveal.is-in :is(.grid4, .collections, .looks-row) > :nth-child(4) { animation-delay: 0.24s; }
+.reveal.is-in :is(.grid4, .collections, .looks-row) > :nth-child(5) { animation-delay: 0.32s; }
+.reveal.is-in :is(.grid4, .collections, .looks-row) > :nth-child(6) { animation-delay: 0.4s; }
+.reveal.is-in :is(.grid4, .collections, .looks-row) > :nth-child(7) { animation-delay: 0.48s; }
+.reveal.is-in :is(.grid4, .collections, .looks-row) > :nth-child(8) { animation-delay: 0.56s; }
+
+@media (prefers-reduced-motion: reduce) {
+  .card__media img, .coll__media img, .lookcard__media img { animation: none !important; }
+  .reveal :is(.grid4, .collections, .looks-row) > * { opacity: 1; animation: none !important; }
+  .card__media::after, .coll__media::after, .lookcard__media::after { display: none; }
+}
+
+.stage__debug { margin: 8px 0 0; padding: 8px 10px; border-radius: 8px; background: #111; color: #9f9; font: 12px/1.5 ui-monospace, monospace; white-space: pre-wrap; text-align: left; }

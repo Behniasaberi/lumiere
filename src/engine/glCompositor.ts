@@ -12,6 +12,7 @@ export interface HairParams {
   rgb: [number, number, number]; // 0..1
   mean: number; // average luminance of the person's hair (0..1)
   amount: number; // 0..1 final opacity
+  warp: number[]; // uv affine [a,b,c, d,e,f]: mask uv = (a·u+b·v+c, d·u+e·v+f) — follows head motion
 }
 export interface LipParams {
   mask: HTMLCanvasElement; // white lip shape inside the lip box
@@ -39,6 +40,7 @@ out vec4 o;
 uniform sampler2D uSrc, uHair, uLip;
 uniform bool uHairOn, uLipOn;
 uniform vec2 uHairTexel;
+uniform vec3 uHairM0, uHairM1;
 uniform vec3 uHairRGB;
 uniform float uHairL, uHairMean, uHairAmt;
 uniform vec4 uLipBox;      // in uv
@@ -67,7 +69,8 @@ void main() {
   float l = luma(base);
 
   if (uHairOn) {
-    float m0 = texture(uHair, uv).r;
+    vec2 mu = vec2(dot(uHairM0, vec3(uv, 1.0)), dot(uHairM1, vec3(uv, 1.0)));
+    float m0 = texture(uHair, mu).r;
     float m = m0;
     // near an edge: joint-bilateral upsampling — the 256px mask is refined by the photo's own edges,
     // so the colour follows real strands and stops at the forehead / background
@@ -79,7 +82,7 @@ void main() {
           vec3 g = texture(uSrc, uv + off).rgb;
           vec3 d = g - base;
           float w = exp(-dot(d, d) * 30.0 - float(i * i + j * j) * 0.2);
-          acc += texture(uHair, uv + off).r * w;
+          acc += texture(uHair, mu + off).r * w;
           ws += w;
         }
       }
@@ -186,7 +189,7 @@ export class GLCompositor {
       return t;
     };
     this.tex = { src: mk(0), hair: mk(1), lip: mk(2) };
-    for (const n of ["uSrc", "uHair", "uLip", "uHairOn", "uLipOn", "uHairTexel", "uHairRGB", "uHairL", "uHairMean", "uHairAmt",
+    for (const n of ["uSrc", "uHair", "uLip", "uHairOn", "uLipOn", "uHairTexel", "uHairM0", "uHairM1", "uHairRGB", "uHairL", "uHairMean", "uHairAmt",
       "uLipBox", "uLipStep", "uLipRGB", "uLipL", "uLipMean", "uLipAmt", "uGloss", "uMatte"]) {
       this.u[n] = gl.getUniformLocation(prog, n);
     }
@@ -219,6 +222,8 @@ export class GLCompositor {
         gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, hair.mw, hair.mh, gl.RED, gl.UNSIGNED_BYTE, hair.mask);
       }
       gl.uniform2f(u.uHairTexel, 1 / hair.mw, 1 / hair.mh);
+      gl.uniform3f(u.uHairM0, hair.warp[0], hair.warp[1], hair.warp[2]);
+      gl.uniform3f(u.uHairM1, hair.warp[3], hair.warp[4], hair.warp[5]);
       gl.uniform3fv(u.uHairRGB, hair.rgb);
       gl.uniform1f(u.uHairL, lumaOf(hair.rgb));
       gl.uniform1f(u.uHairMean, Math.max(0.03, hair.mean));

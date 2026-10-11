@@ -22,6 +22,7 @@ export const SIZE_HINT: Record<string, number> = {
   "vision_wasm_internal.wasm": 9_400_000,
   "face_landmarker.task": 3_760_000,
   "selfie_multiclass_256x256.tflite": 16_400_000,
+  "hair_segmenter.tflite": 782_000,
 };
 
 /**

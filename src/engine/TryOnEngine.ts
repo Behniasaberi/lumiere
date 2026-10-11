@@ -29,11 +29,16 @@ export interface SkinReading {
 
 interface Analysis {
   face: NormalizedLandmark[] | null;
-  hair: { conf: Float32Array; w: number; h: number } | null;
+  /** `warp` maps the mask onto the current frame when it was computed for an earlier one. */
+  hair: { conf: Float32Array; w: number; h: number; warp?: number[] } | null;
 }
 
 const FACE_FILE = "face_landmarker.task";
-const HAIR_FILE = "selfie_multiclass_256x256.tflite";
+// dedicated hair model (0.8 MB, fast); ?hairmodel=multi switches back to the 16 MB multi-class model for comparison
+const HAIR_FILE =
+  typeof location !== "undefined" && location.search.includes("hairmodel=multi")
+    ? "selfie_multiclass_256x256.tflite"
+    : "hair_segmenter.tflite";
 const WASM_FILE = "vision_wasm_internal.wasm";
 // Multi-class selfie model: 0 background, 1 hair, 2 body skin, 3 face skin, 4 clothes, 5 other
 const HAIR_CLASS = 1;
@@ -117,6 +122,10 @@ export class TryOnEngine {
   loadProgress = { face: 0, hair: 0 };
   /** False when the browser has WebGL switched off — the AI models cannot run without it. */
   webgl = true;
+  /** Live timings for the ?debug overlay (ms are running averages). */
+  stats = { faceMs: 0, hairMs: 0, fps: 0, renderer: "" };
+  private fpsCount = 0;
+  private fpsT0 = performance.now();
   sourceKind: "none" | "camera" | "photo" = "none";
 
   private listeners = new Set<() => void>();
@@ -182,6 +191,11 @@ export class TryOnEngine {
   // the camera frame the models saw — the same pixels are drawn, so colour never lags behind the face
   private still = document.createElement("canvas");
   private stillCtx = this.still.getContext("2d")!;
+  // the models only need a small picture (they resize to 256 px inside); feeding them 640 px saves a lot on weak devices
+  private small = document.createElement("canvas");
+  private smallCtx = this.small.getContext("2d")!;
+  private analysisMs = 0; // running average of model time per frame
+  private frameNo = 0;
   private faceLost = 0;
   private prevHair: Float32Array | null = null;
   private lipView = { rgb: [0, 0, 0], alpha: 0, finish: "satin" as Finish };
@@ -217,6 +231,11 @@ export class TryOnEngine {
     try {
       const gl = document.createElement("canvas").getContext("webgl2") ?? document.createElement("canvas").getContext("webgl");
       this.webgl = !!gl;
+      // software-only WebGL (no graphics driver, SwiftShader, VMs): the GPU path is far slower than the CPU one
+      const info = gl?.getExtension("WEBGL_debug_renderer_info");
+      const renderer = info && gl ? String(gl.getParameter(info.UNMASKED_RENDERER_WEBGL)) : "";
+      this.stats.renderer = renderer;
+      if (/swiftshader|basic render|llvmpipe|software/i.test(renderer)) this.delegate = "CPU";
       gl?.getExtension("WEBGL_lose_context")?.loseContext(); // free the test context right away
     } catch {
       this.webgl = false;
@@ -281,8 +300,9 @@ export class TryOnEngine {
       runningMode: "VIDEO" as const,
       numFaces: 1,
     });
-    const hairOpts = (buf: Uint8Array, d: "GPU" | "CPU") => ({
-      baseOptions: { modelAssetBuffer: buf, delegate: d },
+    // hair always on the CPU: on many GPUs the hair mask comes back speckled/dotted
+    const hairOpts = (buf: Uint8Array) => ({
+      baseOptions: { modelAssetBuffer: buf, delegate: "CPU" as const },
       runningMode: "VIDEO" as const,
       outputCategoryMask: false,
       outputConfidenceMasks: true,
@@ -315,7 +335,7 @@ export class TryOnEngine {
       try {
         const fs = this.fileset as never;
         if (this.faceBuf) this.faceLandmarker = await FaceLandmarker.createFromOptions(fs, faceOpts(this.faceBuf, "CPU"));
-        if (this.hairBuf) this.segmenter = await ImageSegmenter.createFromOptions(fs, hairOpts(this.hairBuf, "CPU"));
+        if (this.hairBuf && !this.hairWorker) this.segmenter = await ImageSegmenter.createFromOptions(fs, hairOpts(this.hairBuf));
         this.lastTs = -1;
       } catch (e) {
         console.error(e);
@@ -339,11 +359,18 @@ export class TryOnEngine {
     this.loadHair = async () => {
       this.hairModel = "loading";
       this.emit();
+      this.hairWorker?.terminate();
+      this.hairWorker = null;
+      this.hairBusy = false;
       try {
         this.hairBuf ??= (await download(modelSources(HAIR_FILE), track(HAIR_FILE))).data;
-        // hair always on CPU: on several phone GPUs MediaPipe's confidence masks read back as noise
-        // (blue speckles over the whole frame); the 256×256 model is light enough for the CPU
-        this.segmenter = await create((fs) => ImageSegmenter.createFromOptions(fs, hairOpts(this.hairBuf!, "CPU")));
+        try {
+          this.hairWorker = await this.startHairWorker();
+        } catch (e) {
+          // no module workers / OffscreenCanvas: run the hair model on the page thread instead
+          console.warn("[try-on] hair worker unavailable, using the main thread", e);
+          this.segmenter = await create((fs) => ImageSegmenter.createFromOptions(fs, hairOpts(this.hairBuf!)));
+        }
         this.hairModel = "ready";
       } catch (e) {
         console.error("[try-on] hair model failed", e);
@@ -354,6 +381,110 @@ export class TryOnEngine {
     };
     await this.loadHair();
   }
+
+  // ===================== hair worker =====================
+  private hairWorker: Worker | null = null;
+  private hairBusy = false;
+  private hairReq = 0;
+  private sourceGen = 0;
+  private pendingFace: NormalizedLandmark[] | null = null;
+  /** Latest mask from the worker, with the face it was computed for (to follow head motion). */
+  private asyncHair: { conf: Float32Array; w: number; h: number; face: NormalizedLandmark[] | null } | null = null;
+
+  private startHairWorker(): Promise<Worker> {
+    return new Promise((resolve, reject) => {
+      let w: Worker;
+      try {
+        w = new Worker(new URL("./hairWorker.ts", import.meta.url), { type: "module" });
+      } catch (e) {
+        reject(e);
+        return;
+      }
+      const fs = this.fileset as { wasmLoaderPath: string; wasmBinaryPath: string };
+      const abs = (u: string) => new URL(u, location.href).href;
+      const loader = abs(fs.wasmLoaderPath);
+      const timer = setTimeout(() => {
+        w.terminate();
+        reject(new Error("hair worker did not start"));
+      }, 45000);
+      w.onmessage = (ev) => {
+        if (ev.data.type === "ready") {
+          clearTimeout(timer);
+          w.onmessage = this.onHairMessage;
+          resolve(w);
+        } else if (ev.data.type === "error") {
+          clearTimeout(timer);
+          w.terminate();
+          reject(new Error(ev.data.message));
+        }
+      };
+      w.onerror = (e) => {
+        clearTimeout(timer);
+        w.terminate();
+        reject(e);
+      };
+      w.postMessage({
+        type: "init",
+        wasmDir: loader.slice(0, loader.lastIndexOf("/")),
+        wasmBinaryPath: abs(fs.wasmBinaryPath),
+        model: this.hairBuf!.slice().buffer,
+        hairClass: HAIR_CLASS,
+      });
+    });
+  }
+
+  private onHairMessage = (ev: MessageEvent) => {
+    const m = ev.data;
+    this.hairBusy = false;
+    if (m.gen !== this.sourceGen) return; // a reply for a previous camera/photo
+    if (m.type === "error") {
+      console.warn("[try-on] hair worker:", m.message);
+      return;
+    }
+    if (!m.conf) return;
+    const conf = new Float32Array(m.conf as ArrayBuffer);
+    this.stats.hairMs = this.stats.hairMs ? this.stats.hairMs + (m.ms - this.stats.hairMs) * 0.15 : m.ms;
+    const prev = this.asyncHair;
+    if (prev && prev.conf.length === conf.length && this.sourceKind === "camera") {
+      // steady where nothing moved, follow at once where it did
+      for (let i = 0; i < conf.length; i++) if (Math.abs(conf[i] - prev.conf[i]) < 0.35) conf[i] = prev.conf[i] * 0.4 + conf[i] * 0.6;
+    }
+    this.asyncHair = { conf, w: m.w, h: m.h, face: this.pendingFace };
+    if (this.sourceKind === "photo" && this.photoAnalysis) this.photoAnalysis.hair = { conf, w: m.w, h: m.h };
+    this.dirty = true;
+  };
+
+  /** Sends one frame to the hair worker if it is free (the newest frame always wins). */
+  private requestHair(src: HTMLCanvasElement | HTMLImageElement, face: NormalizedLandmark[] | null) {
+    if (!this.hairWorker || this.hairBusy) return;
+    this.hairBusy = true;
+    const id = ++this.hairReq, gen = this.sourceGen, worker = this.hairWorker;
+    this.pendingFace = face;
+    const sw = srcW(src), sh = srcH(src);
+    const k = Math.min(1, 640 / Math.max(1, sw));
+    createImageBitmap(src, k < 1 ? { resizeWidth: Math.round(sw * k), resizeHeight: Math.round(sh * k) } : {})
+      .then((bitmap) => worker.postMessage({ type: "frame", id, gen, bitmap }, [bitmap]))
+      .catch(() => {
+        this.hairBusy = false;
+      });
+  }
+
+  /** Similarity transform (uv → uv) that moves a mask computed for `from` onto the face `to`. */
+  private hairWarp(from: NormalizedLandmark[] | null, to: NormalizedLandmark[] | null, w: number, h: number): number[] {
+    if (!from || !to) return [1, 0, 0, 0, 1, 0];
+    const P = (f: NormalizedLandmark[], i: number) => [f[i].x * w, f[i].y * h];
+    const [p1x, p1y] = P(to, 234), [p2x, p2y] = P(to, 454), [q1x, q1y] = P(from, 234), [q2x, q2y] = P(from, 454);
+    const dpx = p2x - p1x, dpy = p2y - p1y, dqx = q2x - q1x, dqy = q2y - q1y;
+    const lp = Math.hypot(dpx, dpy);
+    if (lp < 1) return [1, 0, 0, 0, 1, 0];
+    const sc = Math.hypot(dqx, dqy) / lp;
+    const ang = Math.atan2(dqy, dqx) - Math.atan2(dpy, dpx);
+    const a = sc * Math.cos(ang), b = -sc * Math.sin(ang), c = sc * Math.sin(ang), d = sc * Math.cos(ang);
+    const tx = q1x - (a * p1x + b * p1y), ty = q1y - (c * p1x + d * p1y);
+    // pixel-space affine → uv-space rows
+    return [a, (b * h) / w, tx / w, (c * w) / h, d, ty / h];
+  }
+
   private loadHair: () => Promise<void> = async () => {};
   /** Try the hair model again after a failure (shown as a button in the mirror). */
   retryHair() {
@@ -368,7 +499,7 @@ export class TryOnEngine {
     let err: { name?: string } | null = null;
     try {
       stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } },
+        video: { facingMode: "user", width: { ideal: 960 }, height: { ideal: 540 } },
         audio: false,
       });
     } catch (e) {
@@ -452,6 +583,8 @@ export class TryOnEngine {
     this.mirror = mirror;
     this.sourceKind = kind;
     this.photoAnalysis = null;
+    this.sourceGen++; // late replies from the hair worker for the old picture are ignored
+    this.asyncHair = null;
     this.smoothFace = null;
     this.faceFilter.reset();
     this.statsFresh = { hair: false, lip: false };
@@ -536,7 +669,9 @@ export class TryOnEngine {
     const out: Analysis = { face: null, hair: null };
     if (this.rebuilding) return out;
     const ts = this.nextTs();
+    const avg = (v: number, x: number) => (v ? v + (x - v) * 0.15 : x);
     if (needHair && this.segmenter) {
+      const t0 = performance.now();
       try {
         this.segmenter.segmentForVideo(src, ts, (res) => {
           const ms = res.confidenceMasks;
@@ -555,12 +690,15 @@ export class TryOnEngine {
             out.hair = { conf, w: m.width, h: m.height };
           }
         });
+
       } catch (e) {
         this.rebuildOnCpu();
         console.warn(e);
       }
+      this.stats.hairMs = avg(this.stats.hairMs, performance.now() - t0);
     }
     if (needFace && this.faceLandmarker) {
+      const t0 = performance.now();
       try {
         const r = this.faceLandmarker.detectForVideo(src, ts);
         out.face = r.faceLandmarks?.[0] ?? null;
@@ -568,6 +706,7 @@ export class TryOnEngine {
         this.rebuildOnCpu();
         console.warn(e);
       }
+      this.stats.faceMs = avg(this.stats.faceMs, performance.now() - t0);
     }
     return out;
   }
@@ -598,18 +737,20 @@ export class TryOnEngine {
       // Analyse a still photo once (per needed model), then reuse the result for every shade change.
       const c = (this.photoAnalysis ??= { face: null, hair: null });
       const missFace = needFace && !c.face && !!this.faceLandmarker;
-      const missHair = needHair && !c.hair && !!this.segmenter;
-      if (missFace || missHair) {
-        const r = this.analyze(src, missFace, missHair);
+      const missHair = needHair && !c.hair && (!!this.segmenter || !!this.hairWorker);
+      const syncHair = missHair && !this.hairWorker;
+      if (missFace || syncHair) {
+        const r = this.analyze(src, missFace, syncHair);
         if (r.face) c.face = r.face;
         if (r.hair) c.hair = r.hair;
       }
+      if (missHair && this.hairWorker) this.requestHair(src as HTMLImageElement, c.face); // arrives async → redraw
       a = c;
     } else {
       // camera: run the models once per *new* camera frame (not on every screen refresh);
       // repaints in between (shade fades) reuse the last result
       const fresh = !this.paced || this.videoFresh || now - this.lastVideoFrame > 250;
-      const have = (!needFace || this.lastAnalysis.face) && (!needHair || this.lastAnalysis.hair);
+      const have = (!needFace || this.lastAnalysis.face) && (!needHair || !!this.hairWorker || this.lastAnalysis.hair);
       const st = this.still;
       const stale = st.width !== w || st.height !== h;
       if (fresh || !have || stale) {
@@ -619,7 +760,33 @@ export class TryOnEngine {
           st.height = h;
         }
         this.stillCtx.drawImage(src, 0, 0, w, h);
-        a = this.stabilize(this.analyze(st, needFace, needHair), needFace, needHair);
+        const k = Math.min(1, 640 / w);
+        const sw = Math.round(w * k), sh = Math.round(h * k);
+        if (this.small.width !== sw || this.small.height !== sh) {
+          this.small.width = sw;
+          this.small.height = sh;
+        }
+        this.smallCtx.drawImage(st, 0, 0, sw, sh);
+        const t0 = performance.now();
+        if (this.hairWorker) {
+          // face (lipstick) right here on this frame; hair runs on its own thread at its own pace and
+          // its latest mask is moved with the head (face landmarks) so it stays on the hair
+          const raw = this.analyze(this.small, needFace || needHair, false);
+          a = this.stabilize(raw, needFace || needHair, false);
+          if (needHair) {
+            // raw (unsmoothed) landmarks: the mask must follow where the head really is in each frame
+            const rawFace = raw.face ?? a.face;
+            this.requestHair(this.small, rawFace);
+            const ah = this.asyncHair;
+            a = { face: a.face, hair: ah ? { conf: ah.conf, w: ah.w, h: ah.h, warp: this.hairWarp(ah.face, rawFace, w, h) } : null };
+          }
+        } else {
+          // no worker: slow device refreshes the hair mask every other frame
+          const slow = this.analysisMs > 45;
+          const hairNow = needHair && (!slow || this.frameNo++ % 2 === 0 || !this.lastAnalysis.hair);
+          a = this.stabilize(this.analyze(this.small, needFace, hairNow), needFace, needHair);
+        }
+        this.analysisMs += (performance.now() - t0 - this.analysisMs) * 0.1;
       } else if (this.dirty || animating) {
         a = this.lastAnalysis;
       } else return;
@@ -627,6 +794,12 @@ export class TryOnEngine {
     }
     this.dirty = false;
     this.lastAnalysis = a;
+    if (++this.fpsCount >= 10) {
+      const t = performance.now();
+      this.stats.fps = (this.fpsCount * 1000) / (t - this.fpsT0);
+      this.fpsCount = 0;
+      this.fpsT0 = t;
+    }
     this.compose(ctx, img, w, h, a, view, !isPhoto, this.lipView.alpha, this.hairView.alpha);
 
     // Before / after split: paint the untouched original over one side.
@@ -758,7 +931,7 @@ export class TryOnEngine {
 
   // ===================== GPU path: per-frame inputs =====================
   /** Hair mask as bytes + the person's average hair brightness (to remap it onto the shade). */
-  private hairParams(src: Source, mask: { conf: Float32Array; w: number; h: number }, color: string, smooth: boolean, k: number): HairParams | null {
+  private hairParams(src: Source, mask: { conf: Float32Array; w: number; h: number; warp?: number[] }, color: string, smooth: boolean, k: number): HairParams | null {
     const { conf, w: mw, h: mh } = mask;
     const { sampleCanvas, sctx } = this;
     if (sampleCanvas.width !== mw || sampleCanvas.height !== mh) {
@@ -788,7 +961,7 @@ export class TryOnEngine {
     this.hairLum = smooth && this.statsFresh.hair ? this.hairLum + (measured - this.hairLum) * 0.15 : measured;
     this.statsFresh.hair = true;
     const rgb = hexToRgb(color).map((v) => v / 255) as [number, number, number];
-    return { mask: bytes, mw, mh, rgb, mean: this.hairLum, amount: this.hairIntensity * k };
+    return { mask: bytes, mw, mh, rgb, mean: this.hairLum, amount: this.hairIntensity * k, warp: mask.warp ?? [1, 0, 0, 0, 1, 0] };
   }
 
   /** Crisp, curved lip shape in a small box around the mouth + the bare lips' brightness. */
@@ -1105,6 +1278,11 @@ export class TryOnEngine {
     frame.height = h;
     frame.getContext("2d")!.drawImage(src, 0, 0, w, h);
     const a = this.analyze(frame, !!this.faceLandmarker, !!this.segmenter);
+    if (!a.hair && this.hairWorker) {
+      // hair comes from the worker: reuse its latest mask for this frozen frame
+      const ah = this.sourceKind === "photo" ? this.photoAnalysis?.hair : this.asyncHair;
+      if (ah) a.hair = { conf: ah.conf, w: ah.w, h: ah.h, warp: this.hairWarp(this.asyncHair?.face ?? null, a.face, w, h) };
+    }
     return { frame, a };
   }
 
