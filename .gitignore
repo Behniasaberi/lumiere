@@ -1,0 +1,9 @@
+node_modules
+dist
+public/mediapipe
+public/models/*.task
+public/models/*.tflite
+*.tsbuildinfo
+render.html
+src/render
+.env
