@@ -60,6 +60,13 @@ export function TryOnStage({ shape = "frame", split = null, onSplit, compact }: 
 
   const modelsFailed = e.face === "failed" && e.hairModel === "failed";
   const loading = e.face === "loading" || e.hairModel === "loading";
+  const pct = (v: number) => Math.round(v * 100).toLocaleString("fa-IR") + "٪";
+  const loadingText =
+    e.face === "loading"
+      ? `آینه در حال آماده شدن است… ${pct(e.loadProgress.face)}`
+      : e.hairModel === "loading"
+        ? `رژ آماده است؛ رنگ مو در حال بارگذاری… ${pct(e.loadProgress.hair)}`
+        : "";
   const hint =
     e.hint === "no-face"
       ? "صورت پیدا نشد. رو به دوربین و در نور خوب قرار بگیرید."
@@ -112,7 +119,7 @@ export function TryOnStage({ shape = "frame", split = null, onSplit, compact }: 
         )}
 
         {e.hasSource && (hint || loading) && (
-          <p className="stage__hint" role="status">{loading ? "آینه در حال آماده شدن است…" : hint}</p>
+          <p className="stage__hint" role="status">{loading ? loadingText : hint}</p>
         )}
       </div>
 

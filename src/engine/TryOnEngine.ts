@@ -3,6 +3,7 @@
 // no camera frame or photo ever leaves the device.
 import { hexToRgb, rgbToHex, rgbToLab } from "./color";
 import { GLCompositor, type HairParams, type LipParams } from "./glCompositor";
+import { SIZE_HINT, WASM_SOURCES, download, modelSources } from "./assets";
 import type { FaceLandmarker as FL, ImageSegmenter as IS, NormalizedLandmark } from "@mediapipe/tasks-vision";
 
 export type Finish = "matte" | "satin" | "gloss";
@@ -31,10 +32,9 @@ interface Analysis {
   hair: { conf: Float32Array; w: number; h: number } | null;
 }
 
-const BASE = import.meta.env.BASE_URL;
-const WASM_PATH = BASE + "mediapipe/wasm";
-const FACE_MODEL = BASE + "models/face_landmarker.task";
-const HAIR_MODEL = BASE + "models/selfie_multiclass_256x256.tflite";
+const FACE_FILE = "face_landmarker.task";
+const HAIR_FILE = "selfie_multiclass_256x256.tflite";
+const WASM_FILE = "vision_wasm_internal.wasm";
 // Multi-class selfie model: 0 background, 1 hair, 2 body skin, 3 face skin, 4 clothes, 5 other
 const HAIR_CLASS = 1;
 const BODY_SKIN_CLASS = 2;
@@ -113,6 +113,8 @@ export class TryOnEngine {
   hairModel: ModelState = "idle";
   delegate: "GPU" | "CPU" = "GPU";
   hint: Hint = "";
+  /** Download progress 0..1: `face` covers the engine + face model (lipstick), `hair` the hair model. */
+  loadProgress = { face: 0, hair: 0 };
   sourceKind: "none" | "camera" | "photo" = "none";
 
   private listeners = new Set<() => void>();
@@ -211,10 +213,46 @@ export class TryOnEngine {
   private async loadModels() {
     this.face = this.hairModel = "loading";
     this.emit();
+
+    // progress across the parallel downloads (throttled emits)
+    const bytes: Record<string, [number, number]> = {};
+    let lastEmit = 0;
+    const part = (keys: string[]) => {
+      let a = 0, b = 0;
+      for (const k of keys) {
+        const v = bytes[k];
+        a += v ? v[0] : 0;
+        b += v ? v[1] : SIZE_HINT[k] ?? 0;
+      }
+      return b ? Math.min(1, a / b) : 0;
+    };
+    const track = (key: string) => (loaded: number, total: number) => {
+      bytes[key] = [loaded, total];
+      this.loadProgress = { face: part([WASM_FILE, FACE_FILE]), hair: part([HAIR_FILE]) };
+      const now = performance.now();
+      if (now - lastEmit > 150) {
+        lastEmit = now;
+        this.emit();
+      }
+    };
+
+    // lipstick first: engine + face model download together; the big hair model waits its turn
+    const faceDl = download(modelSources(FACE_FILE), track(FACE_FILE));
+    faceDl.catch(() => {});
     let vision: typeof import("@mediapipe/tasks-vision");
     try {
-      vision = await import("@mediapipe/tasks-vision");
-      this.fileset = await vision.FilesetResolver.forVisionTasks(WASM_PATH);
+      const [mod, wasm] = await Promise.all([
+        import("@mediapipe/tasks-vision"),
+        download(WASM_SOURCES.map((d) => `${d}/${WASM_FILE}`), track(WASM_FILE), { minBytes: 1_000_000 }),
+      ]);
+      vision = mod;
+      const dir = wasm.source.slice(0, wasm.source.lastIndexOf("/"));
+      const fs = await vision.FilesetResolver.forVisionTasks(dir);
+      // hand MediaPipe the bytes we already have, so the 9 MB engine is never downloaded twice
+      if (fs.wasmBinaryPath.endsWith(WASM_FILE)) {
+        fs.wasmBinaryPath = URL.createObjectURL(new Blob([wasm.data], { type: "application/wasm" }));
+      }
+      this.fileset = fs;
     } catch (e) {
       console.error(e);
       this.face = this.hairModel = "failed";
@@ -222,13 +260,7 @@ export class TryOnEngine {
       return;
     }
     const { FaceLandmarker, ImageSegmenter } = vision;
-    const fetchModel = async (url: string) => {
-      const r = await fetch(url);
-      if (!r.ok) throw new Error(`${url} → HTTP ${r.status}`);
-      const buf = new Uint8Array(await r.arrayBuffer());
-      if (buf.length < 100000) throw new Error(`${url} is not a model file`);
-      return buf;
-    };
+    const localFileset = () => vision.FilesetResolver.forVisionTasks(WASM_SOURCES[WASM_SOURCES.length - 1]);
     const faceOpts = (buf: Uint8Array, d: "GPU" | "CPU") => ({
       baseOptions: { modelAssetBuffer: buf, delegate: d },
       runningMode: "VIDEO" as const,
@@ -240,7 +272,7 @@ export class TryOnEngine {
       outputCategoryMask: false,
       outputConfidenceMasks: true,
     });
-    const create = async <T>(make: (d: "GPU" | "CPU") => Promise<T>) => {
+    const withDelegate = async <T>(make: (d: "GPU" | "CPU") => Promise<T>) => {
       try {
         return await make(this.delegate);
       } catch (e) {
@@ -248,6 +280,16 @@ export class TryOnEngine {
         console.warn("GPU mode failed, using CPU", e);
         this.delegate = "CPU";
         return await make("CPU");
+      }
+    };
+    // if the CDN copy of the engine can't start, fall back to the site's own copy
+    const create = async <T>(make: (fs: never, d: "GPU" | "CPU") => Promise<T>) => {
+      try {
+        return await withDelegate((d) => make(this.fileset as never, d));
+      } catch (e) {
+        console.warn("[try-on] engine from CDN failed, using local copy", e);
+        this.fileset = await localFileset();
+        return await withDelegate((d) => make(this.fileset as never, d));
       }
     };
     // Rebuild on CPU if the GPU breaks at runtime (some drivers do).
@@ -268,33 +310,27 @@ export class TryOnEngine {
       this.emit();
     };
 
-    const fs = this.fileset as never;
-    await Promise.all([
-      (async () => {
-        try {
-          this.faceBuf = await fetchModel(FACE_MODEL);
-          this.faceLandmarker = await create((d) => FaceLandmarker.createFromOptions(fs, faceOpts(this.faceBuf!, d)));
-          this.face = "ready";
-        } catch (e) {
-          console.error(e);
-          this.face = "failed";
-        }
-        this.dirty = true;
-        this.emit();
-      })(),
-      (async () => {
-        try {
-          this.hairBuf = await fetchModel(HAIR_MODEL);
-          this.segmenter = await create((d) => ImageSegmenter.createFromOptions(fs, hairOpts(this.hairBuf!, d)));
-          this.hairModel = "ready";
-        } catch (e) {
-          console.error(e);
-          this.hairModel = "failed";
-        }
-        this.dirty = true;
-        this.emit();
-      })(),
-    ]);
+    try {
+      this.faceBuf = (await faceDl).data;
+      this.faceLandmarker = await create((fs, d) => FaceLandmarker.createFromOptions(fs, faceOpts(this.faceBuf!, d)));
+      this.face = "ready";
+    } catch (e) {
+      console.error(e);
+      this.face = "failed";
+    }
+    this.dirty = true;
+    this.emit();
+
+    try {
+      this.hairBuf = (await download(modelSources(HAIR_FILE), track(HAIR_FILE))).data;
+      this.segmenter = await create((fs, d) => ImageSegmenter.createFromOptions(fs, hairOpts(this.hairBuf!, d)));
+      this.hairModel = "ready";
+    } catch (e) {
+      console.error(e);
+      this.hairModel = "failed";
+    }
+    this.dirty = true;
+    this.emit();
   }
   private rebuildOnCpu: () => Promise<void> = async () => {};
 
